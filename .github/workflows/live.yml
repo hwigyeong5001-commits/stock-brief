@@ -1,0 +1,46 @@
+# 장중 실시간 갱신(PC가 꺼져 있어도): 5분마다 현재가·분봉을 받아 암호화한 live.json을 live 브랜치에 올린다.
+# live 브랜치는 커밋 하나만 덮어쓴다 → 기록이 쌓이지 않고 Pages 빌드도 안 일어난다. 페이지는 raw 주소로 읽는다.
+# 로그는 공개라 종목 이름이 찍히지 않게 출력은 버린다.
+name: live
+on:
+  schedule:
+    - cron: "*/5 0-6,13-21 * * 1-5"  # UTC = 한국 09~15시(국내장), 22~06시(미국장). 장 시간 판단은 brief.py가 한다
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "장 시간이 아니어도 실행"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: live
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TZ: Asia/Seoul
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: cloud/requirements.txt
+      - run: pip install -q -r cloud/requirements.txt > /dev/null
+      - name: 시세 받기
+        env:
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+          LIVE_OUT: ${{ runner.temp }}/out
+        run: |
+          [ -n "$SITE_PASSWORD" ] || { echo "저장소 비밀값 SITE_PASSWORD가 없습니다"; exit 1; }
+          python cloud/brief.py live ${{ inputs.force && '--force' || '' }} > /dev/null 2>&1 || { echo "실행 실패(로그는 비공개로 버림)"; exit 1; }
+          [ -f "$LIVE_OUT/live.json" ] && echo "갱신 파일 생성" || echo "장 시간이 아니라 건너뜀"
+      - name: live 브랜치에 올리기
+        run: |
+          cd "${{ runner.temp }}/out" 2>/dev/null && [ -f live.json ] || exit 0
+          git init -q -b live
+          git add live.json
+          git -c user.name=live-bot -c user.email=live-bot@users.noreply.github.com commit -qm "실시간 $(date '+%m-%d %H:%M')"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" live
