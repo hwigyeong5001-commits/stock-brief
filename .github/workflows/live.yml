@@ -4,7 +4,7 @@
 name: live
 on:
   schedule:
-    - cron: "*/5 0-6,13-21 * * 1-5"  # UTC = 한국 09~15시(국내장), 22~06시(미국장). 장 시간 판단은 brief.py가 한다
+    - cron: "*/5 0-6,8-23 * * 1-5"  # UTC = 한국 09~15시(국내장), 17시~다음 날 10시(미국 프리·정규·애프터). 장 시간 판단은 brief.py가 한다
   workflow_dispatch:
     inputs:
       force:
