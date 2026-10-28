@@ -78,12 +78,21 @@ def fetch_intraday(tickers):
             INTRA_DF[iv] = None
 
 
-def quote(t):
-    """거래소 공식 시세(현재가·전일 종가·마지막 체결 시각). 거래가 뜸한 종목은 일봉 종가(마지막 체결가)와 공식 종가가 달라서 쓴다."""
+def quote(t, ext=False):
+    """거래소 공식 시세(현재가·전일 종가·마지막 체결 시각). 거래가 뜸한 종목은 일봉 종가(마지막 체결가)와 공식 종가가 달라서 쓴다.
+    ext=True(실시간용): 프리·애프터마켓 체결이 정규장보다 최근이면 그 가격, 비교 기준은 마지막 정규장 종가. 4번째 값 = 세션 이름."""
     try:
         i = yf.Ticker(t).info
         p, pc, ts = i.get("regularMarketPrice"), i.get("previousClose"), i.get("regularMarketTime")
-        return (float(p), float(pc), int(ts)) if p and pc else None
+        if not (p and pc):
+            return None
+        if ext:
+            best = max(((i.get(f"{k}Price"), i.get(f"{k}Time"), name) for k, name in (("preMarket", "프리마켓"), ("postMarket", "애프터마켓"))
+                        if i.get(f"{k}Price") and i.get(f"{k}Time")), key=lambda x: x[1], default=None)
+            if best and best[1] > ts:
+                return float(best[0]), float(p), int(best[1]), best[2]
+            return float(p), float(pc), int(ts), "정규장"
+        return float(p), float(pc), int(ts)
     except Exception:
         return None
 
@@ -694,7 +703,7 @@ def collect(kind):
     fx_chg = q.get("KRW=X", (0, 0))[1]  # 해외 종목의 오늘 원화 손익엔 환율 변동도 들어간다
     prev = lambda h: h["won"] / (1 + (h["chg"] if h["fresh"] else 0) / 100) / (1 if h["ticker"].endswith((".KS", ".KQ")) else 1 + fx_chg / 100)
     acct = {"pnl": round((val / cost - 1) * 100, 1) if cost else None, "total": sum(h["won"] for h in hold),
-            "today": round(sum(h["won"] - prev(h) for h in hold)), "fx_chg": round(fx_chg, 2),
+            "today": round(sum(h["won"] - prev(h) for h in hold)), "fx_chg": round(fx_chg, 2), "fx": round(fx, 2),
             "fx_ok": "KRW=X" in q, "missing": missing, "groups": groups, "shock": shock,
             "gain": round(val - cost), "costed_n": len(costed), "hold_n": len(hold)}
     return {"id": bid(kind), "kind": kind, "at": dt.datetime.now().isoformat(timespec="minutes"),
@@ -731,6 +740,7 @@ NOTE_FORMAT = ('JSON 하나만 출력: {"headline": "가장 중요한 한 가지
                '"down": "하락 시나리오: 어떤 가격·조건이 깨지면 어떤 흐름"}}], '
                '"sources": [{"title": "근거 기사 제목", "url": "주소"}]}. '
                "holdings는 입력 hold의 모든 종목을 같은 순서로 쓴다. 이 브리핑의 중심이다. "
+               "해외 가격은 반드시 '23.85달러'처럼 숫자 바로 뒤에 '달러'를 붙여 쓴다($ 기호 금지) — 화면·카톡에서 원화로 자동 환산된다. "
                "차트 해석과 시나리오는 hold의 tech(레버리지 ETF는 base_tech 먼저) 값만 근거로 쓰고 가격은 실제 값을 인용한다. "
                "독자는 주식 초보다: 모든 문장은 쉬운 말로 쓰고, 전문용어(ADX·RSI·ATR·OBV·스윙·무효화 등)는 본문에 쓰지 말거나 "
                "쉬운 말 뒤 괄호에만 넣는다(예: '하루에 흔들리는 폭(ATR)'). '고점·저점이 계속 낮아지는 중', '자주 막혔던 가격대', "
@@ -849,6 +859,16 @@ def page(kind, title, inner):
             f'<div class="ft">시세: Yahoo Finance{link} · 시장 해설이며 매매 권유가 아닙니다.</div>')
 
 
+_NUM = r"(\d[\d,]*(?:\.\d+)?)"
+
+
+def krw_text(s, fx):
+    """문장 속 '23.85달러'·'22.16~23.47달러'를 원화로(사용자 요청: 모든 가격은 원 표기). 홈페이지 template의 krwText와 같은 규칙."""
+    won = lambda x: f"{float(x.replace(',', '')) * fx:,.0f}"
+    s = re.sub(_NUM + r"(\s*[~∼–-]\s*)" + _NUM + r"\s*달러", lambda m: f"{won(m[1])}{m[2]}{won(m[3])}원", str(s))
+    return re.sub(_NUM + r"\s*달러", lambda m: f"{won(m[1])}원", s)
+
+
 def market_html(d, note):
     cells = "".join(f'<div><div class="n">{m["name"]}</div><div class="v">{m["value"]:,.2f}</div>'
                     f'<div class="c">{chg(m["chg"])}</div></div>' for m in d["market"])
@@ -857,7 +877,7 @@ def market_html(d, note):
         f'<div class="bar"><span>{s["name"]}</span><div class="track"><i style="{"left:50%" if s["chg"] >= 0 else "right:50%"};'
         f'width:{abs(s["chg"]) / mx * 48:.1f}%;background:{"#e58b84" if s["chg"] >= 0 else "#8aa8e6"}"></i></div>'
         f'<span class="v">{chg(s["chg"], 1)}</span></div>' for s in d["sector"])
-    e = html.escape
+    e = lambda s: html.escape(krw_text(s, d["acct"].get("fx") or 1400))
     body = f'<div class="h">흐름</div><p>{e(note.get("flow", ""))}</p>'
     if note.get("points"):
         body += '<div class="h">관망 포인트</div>' + "".join(f"<p>- {e(p)}</p>" for p in note["points"])
@@ -880,11 +900,12 @@ def account_html(d, note):
     pnl = a["pnl"] or 0
     sign = lambda x: f"{'+' if x >= 0 else '−'}{abs(x):,.0f}원"
     views = {v.get("name"): v for v in note.get("holdings", [])}
-    e = html.escape
+    fx = d["acct"].get("fx") or 1400
+    e = lambda s: html.escape(krw_text(s, fx))
 
-    def price(h):  # 1주당 현재가(해외는 달러)
+    def price(h):  # 1주당 현재가(해외도 원화로 환산)
         p = (h.get("tech") or {}).get("price")
-        return "–" if p is None else f"{p:,.0f}원" if h.get("ticker", "").endswith((".KS", ".KQ")) else f"{p}달러"
+        return "–" if p is None else f"{p if h.get('ticker', '').endswith(('.KS', '.KQ')) else p * fx:,.0f}원"
 
     def view(h):
         v = views.get(h["name"])
@@ -929,7 +950,7 @@ def summary_html(d, note):
         diff = px * h["chg"] / (100 + h["chg"])  # 1주당 오늘 움직인 가격
         cls = "up" if h["chg"] > 0 else "dn" if h["chg"] < 0 else "eq"
         a = "▲" if h["chg"] > 0 else "▼" if h["chg"] < 0 else "–"
-        fmt = (lambda v: f"{v:,.0f}원") if kr else (lambda v: f"{v:,.2f}달러")
+        fmt = lambda v: f"{v * (1 if kr else d['acct'].get('fx') or 1400):,.0f}원"  # 해외도 원화로(브리핑 때 환율)
         line = dir_line(h) or views.get(h["name"], {}).get("line", "")
         rows += (f'<div class="r"><div class="l"><b>{e(h["name"])}</b><span>{e(line)}</span></div>'
                  f'<div class="p"><b>{fmt(px)}</b><span class="{cls}">{a} {abs(h["chg"]):.2f}% · {fmt(abs(diff))}</span></div></div>')
@@ -1040,11 +1061,16 @@ def delta(a, b):
                                                       "상승세" if t["adx"] > 25 else "박스권")
     if flow(ta) and flow(tb) and flow(ta) != flow(tb):
         out.append(f"흐름 {flow(ta)} → {flow(tb)}")
+    sa, sb = (a.get("dir") or {}).get("state"), (b.get("dir") or {}).get("state")
+    if sa and sb and sa != sb:
+        out.append(f"차트 판정 {sa} → {sb}")
     pa, pb = a.get("prob") or {}, b.get("prob") or {}
-    for k, label in (("up", "좋은 신호 가격"), ("dn", "조심 가격")):
+    # 해외 가격은 '달러'를 붙여 둔다 → 홈페이지가 원화로 바꿔 보여 줌
+    unit = (lambda v: f"{v:,.0f}원") if (pb.get("inst") or "").endswith((".KS", ".KQ")) else (lambda v: f"{v:g}달러")
+    for k, label in (("up", "위쪽 기준"), ("dn", "아래쪽 기준")):
         va, vb = (pa.get("levels") or {}).get(k), (pb.get("levels") or {}).get(k)
         if va and vb and abs(vb / va - 1) > 0.01:
-            out.append(f"{label} {va:g} → {vb:g}")
+            out.append(f"{label} {unit(va)} → {unit(vb)}")
     ha, hb = ((pa.get("h") or {}).get("20") or {}), ((pb.get("h") or {}).get("20") or {})
     if ha and hb and abs(hb["up"] - ha["up"]) >= 5:
         out.append(f"한 달 '좋은 신호 먼저' {ha['up']}% → {hb['up']}%")
@@ -1161,19 +1187,21 @@ def _push(repo, files, msg, squash_live=False):
         lock.unlink(missing_ok=True)
 
 
-def market_open(now=None):
-    """국내(평일 09:00~15:40) 또는 미국(한국 시각 22:20~다음 날 06:10, 서머타임 양쪽 포함) 장중인지."""
+def market_open(now=None, ext=False):
+    """국내(평일 09:00~15:40) 또는 미국(한국 시각 22:20~다음 날 06:10, 서머타임 양쪽 포함) 장중인지.
+    ext=True: 미국 프리마켓(17:00~)·애프터마켓(~10:10)까지 — 실시간 갱신용."""
     now = now or dt.datetime.now()
     t, wd = now.time(), now.weekday()
     kr = wd < 5 and dt.time(9, 0) <= t <= dt.time(15, 40)
-    us = (wd < 5 and t >= dt.time(22, 20)) or (0 < wd <= 5 and t <= dt.time(6, 10))
+    start, end = (dt.time(17, 0), dt.time(10, 10)) if ext else (dt.time(22, 20), dt.time(6, 10))
+    us = (wd < 5 and t >= start) or (0 < wd <= 5 and t <= end)
     return kr or us
 
 
 def live(force=False):
     """장중 10분마다(작업 스케줄러): 보유 종목 분봉·현재가만 새로 받아 암호화한 live.json으로 올린다. 노트·확률은 그대로."""
     import pandas as pd
-    if not (force or market_open()):
+    if not (force or market_open(ext=True)):
         return
     p = HERE / "holdings.csv"
     if not p.exists():  # 클라우드: 암호화된 보유 목록을 풀어서 쓴다(파일로 남기지 않음)
@@ -1200,15 +1228,17 @@ def live(force=False):
             continue
         prev = before.iloc[-1]  # 세션 날짜보다 앞선 마지막 일봉 = 전일 종가
         kst = ts.tz_convert("Asia/Seoul") if ts.tzinfo else ts
-        px, at = float(s.iloc[-1]), kst.strftime("%m-%d %H:%M")
-        if not t.endswith((".KS", ".KQ")) and (qt := quote(t)):  # 미국: 공식 시세(현재가·전일 종가·마지막 체결)
-            px, prev, at = qt[0], qt[1], dt.datetime.fromtimestamp(qt[2]).strftime("%m-%d %H:%M")
+        px, at, sess = float(s.iloc[-1]), kst.strftime("%m-%d %H:%M"), "정규장"
+        if not t.endswith((".KS", ".KQ")) and (qt := quote(t, ext=True)):  # 미국: 공식 시세(프리·애프터마켓 포함, 마지막 체결)
+            px, prev, at, sess = qt[0], qt[1], dt.datetime.fromtimestamp(qt[2]).strftime("%m-%d %H:%M"), qt[3]
         base = (h.get("기초") or "").strip()
-        bq = quote(base) if base else None  # 2배 ETF가 따라가는 주식의 지금 가격
+        bq = quote(base, ext=True) if base else None  # 2배 ETF가 따라가는 주식의 지금 가격
         out[h["종목명"]] = {"price": round(px, 0 if px >= 1000 else 2 if px >= 1 else 4), "chg": round((px / prev - 1) * 100, 2),
-                           "at": at, "tf": {iv: tech_tf(t, iv) for iv in INTRA},
+                           "at": at, "session": sess, "tf": {iv: tech_tf(t, iv) for iv in INTRA},
                            "base_price": round(bq[0], 2) if bq else None, "base_chg": round((bq[0] / bq[1] - 1) * 100, 2) if bq else None}
-    body = json.dumps({"at": dt.datetime.now().isoformat(timespec="minutes"), "holds": out}, ensure_ascii=False)
+    fq = quote("KRW=X")  # 홈페이지 원화 환산용 지금 환율
+    body = json.dumps({"at": dt.datetime.now().isoformat(timespec="minutes"), "holds": out, "fx": round(fq[0], 2) if fq else None},
+                      ensure_ascii=False)
     if not CFG.get("site_password"):
         sys.exit("site_password가 없어 실시간 파일을 올리지 않습니다")
     if os.environ.get("LIVE_OUT"):  # 클라우드: 파일만 쓰고 올리기는 워크플로가 live 브랜치로
@@ -1323,7 +1353,7 @@ def lines_text(kind, d, note):
         if not line and h.get("prob"):
             kr = (h["base"] or h["ticker"]).endswith((".KS", ".KQ"))
             up = h["prob"]["levels"]["up"]
-            line = "위쪽 기준 " + (f"{h['base']} " if h["base"] else "") + (f"{up:,.0f}원" if kr else f"{up}달러")
+            line = "위쪽 기준 " + (f"{h['base']} " if h["base"] else "") + f"{up * (1 if kr else d['acct'].get('fx') or 1400):,.0f}원"
         rows.append(f"{h['name']} {a}{abs(h['chg']):.1f}% {line or ''}".strip())
     head = f"[{'아침' if kind == 'am' else '오후'} 내 종목 한 줄 전망]\n"
     msgs, cur = [], head
