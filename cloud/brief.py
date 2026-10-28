@@ -316,6 +316,50 @@ def chart_prob(inst, T, pool):
     return {"levels": {"up": T["res"], "dn": T["sup_lo"]}, "inst": inst, "h": out}
 
 
+# 방향 판정 걷기 검증(2026-10-28, 5년·국내외 25종목, 그날까지 결과가 나온 과거만 써서 예측): 동전 던지기와 차이 없음.
+# 다른 신호 묶음(과열·과매도, 평균 이탈, 120일 추세)도 44~55%로 같았다. 실전 성적은 score()가 따로 쌓는다.
+DIR_CHECK = {"at": "2026-10-28", "years": 5, "stocks": 25, "n5": 3251, "hit5": 49.5, "n20": 809, "hit20": 47.2}
+DIR_SIGNALS = ["주가가 한 달 평균보다 위", "한 달 평균이 석 달 평균보다 위", "단기 힘(MACD)이 오르는 쪽", "한 달 전보다 높음"]
+
+
+def _trend_signals(c):
+    """차트 신호 4개(불리언 시계열)와 점수(0~4, 석 달 평균이 생긴 뒤부터)."""
+    ema = lambda s, n: s.ewm(span=n, adjust=False).mean()
+    ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+    macd = ema(c, 12) - ema(c, 26)
+    sig = [c > ma20, ma20 > ma60, macd > ema(macd, 9), c > c.shift(20)]
+    return sig, sum(s.astype(int) for s in sig).where(ma60.notna())
+
+
+def direction(inst, pool):
+    """차트 판정: 지금 신호 상태 + 같은 상태였던 과거(자기 + 같은 시장 풀) N일 뒤 지금보다 높았던 비율(PROB_M으로 풀 쪽으로 당김)."""
+    import pandas as pd
+    c = OHLCV["Close"][inst].dropna()
+    sig, s = _trend_signals(c)
+    if len(c) < 120 or pd.isna(s.iloc[-1]):
+        return None
+    now = int(s.iloc[-1])
+
+    def rate(t, n):
+        c = OHLCV["Close"][t].dropna()
+        s, fwd = _trend_signals(c)[1], c.shift(-n)
+        ok = s.notna() & fwd.notna()
+        m = ok & (s == now)
+        return int((fwd[m] > c[m]).sum()), int(m.sum()), float((fwd[ok] > c[ok]).mean()) if ok.any() else None
+
+    out = {}
+    for n in (5, 20):
+        ou, on, base = rate(inst, n)
+        ps = [rate(p, n) for p in pool if p in OHLCV["Close"] and data_ok(p)]
+        pu, pn = sum(x[0] for x in ps), sum(x[1] for x in ps)
+        pool_r = pu / pn if pn else 0.5
+        ne = on / n  # 겹치는 창 → 유효 표본
+        p = ((ou / on if on else pool_r) * ne + PROB_M * pool_r) / (ne + PROB_M)
+        out[str(n)] = {"up": round(p * 100), "base": None if base is None else round(base * 100), "n": on, "n_eff": round(ne)}
+    return {"inst": inst, "score": now, "signals": [[k, bool(x.iloc[-1])] for k, x in zip(DIR_SIGNALS, sig)],
+            "state": "오르는 흐름" if now >= 3 else "내리는 흐름" if now <= 1 else "엇갈린 흐름", "p": out, "check": DIR_CHECK}
+
+
 def outlook_prob(cp, tone, inputs, n):
     """전망 반영 확률: 차트 확률을 로그오즈로 바꿔 요인을 상한 안에서 더한다(Δ 방향, V 양쪽 꼬리)."""
     import math
@@ -376,7 +420,8 @@ def score():
                     pend[r["name"]] = {"name": r["name"], "id": r["id"], "days": len(fut), "hit": hit,
                                        "now": round(float(fut.iloc[-1]), 4) if len(fut) else None,
                                        "inst": r["inst"], "up": r["levels"]["up"], "dn": r["levels"]["dn"],
-                                       "top": "·".join(o for o, v in zip(["위", "둘 다 아님", "아래"], c) if v == max(c)), "top_p": max(c)}
+                                       "top": "·".join(o for o, v in zip(["위", "둘 다 아님", "아래"], c) if v == max(c)), "top_p": max(c),
+                                       "price": r["price"], "dir_p": r.get("dir", {}).get("5")}
                 continue
             last[k] = fut.index[int(n) - 1].tz_localize(None) if fut.index.tz is not None else fut.index[int(n) - 1]
             hit = [0, 1, 0]  # 위 먼저, 둘 다 아님, 아래 먼저
@@ -387,11 +432,20 @@ def score():
                 if x <= r["levels"]["dn"]:
                     hit = [0, 0, 1]
                     break
-            out[n].append({"id": r["id"], "name": r["name"], "hit": hit,
-                           "chart": brier(r["chart"][n], hit), "outlook": brier(r["outlook"][n], hit)})
-    summary = {n: {"n": len(v), "chart": round(sum(x["chart"] for x in v) / len(v), 3) if v else None,
-                   "outlook": round(sum(x["outlook"] for x in v) / len(v), 3) if v else None, "uniform": 0.667}
-               for n, v in out.items()}
+            item = {"id": r["id"], "name": r["name"], "hit": hit,
+                    "chart": brier(r["chart"][n], hit), "outlook": brier(r["outlook"][n], hit)}
+            if "dir" in r:  # 방향 판정: n거래일 뒤 종가가 예측 때보다 높았나(2갈래 Brier, 반반 찍기 0.25)
+                item["dir"], item["rose"] = r["dir"][n], int(float(fut.iloc[int(n) - 1]) > r["price"])
+            out[n].append(item)
+    summary = {}
+    for n, v in out.items():
+        dv = [x for x in v if "dir" in x]
+        called = [x for x in dv if x["dir"] != 50]
+        summary[n] = {"n": len(v), "chart": round(sum(x["chart"] for x in v) / len(v), 3) if v else None,
+                      "outlook": round(sum(x["outlook"] for x in v) / len(v), 3) if v else None, "uniform": 0.667,
+                      "dir": {"n": len(dv), "brier": round(sum((x["dir"] / 100 - x["rose"]) ** 2 for x in dv) / len(dv), 3) if dv else None,
+                              "hit": round(sum((x["dir"] > 50) == bool(x["rose"]) for x in called) / len(called) * 100) if called else None,
+                              "uniform": 0.25}}
     (HERE / "data" / "scores.json").write_text(json.dumps({"at": dt.datetime.now().isoformat(timespec="minutes"),
                                                           "summary": summary, "items": out, "pending": list(pend.values())},
                                                          ensure_ascii=False), "utf-8")
@@ -616,7 +670,8 @@ def collect(kind):
                                       or any(f["risky"] for f in (h.get("filings") or [])),  # 증자 관련 공시도 희석 요인
                             "earn_days": earn_days.get(h["name"])}
         h["prob"] = cp
-    costed = [h for h in hold if h["cost"]]
+        h["dir"] = direction(inst, pool) if data_ok(inst) else None
+    costed =[h for h in hold if h["cost"]]
     val, cost = sum(h["won"] for h in costed), sum(h["cost"] for h in costed)
     # GPT 3차 ①③: 같은 기초 종목 묶음 비중·방향 노출(2배 ETF는 2배), 하루 급락 충격
     total_won = sum(h["won"] for h in hold) or 1
@@ -669,8 +724,8 @@ NOTE_FORMAT = ('JSON 하나만 출력: {"headline": "가장 중요한 한 가지
                '"holdings": [{"name": "입력 hold의 name 그대로", "why": "오늘 움직인 이유 1줄(뉴스 근거, 근거가 약하면 끝에 \'(추정)\')", '
                '"watch": "다음에 지켜볼 것 1줄(일정·기초 종목·공시·지표)", "risk": "사실 기반 위험 1줄(희석·레버리지 손실·공매도 등)", '
                '"tone": "우호|중립|비우호 중 하나 — 뉴스 흐름의 방향", '
-               '"simple": "주식 초보도 바로 알아듣는 한 줄: 지금 어떤 상태인지만(좋은 신호·조심 가격은 화면에 따로 나오니 쓰지 않음). 전문용어·영문 약어 금지", '
-               '"line": "카톡용 오늘의 한 줄 전망, 22자 이내, 쉬운 말 + 가격 하나(예: 박스권, 위쪽 기준 BMNR 23.85달러)", '
+               '"simple": "주식 초보용 한 줄 차트 평가: 지금 오르는 흐름인지 내리는 흐름인지와 가장 큰 이유 하나(hold의 dir.state·dir.signals 근거, '
+               '2배 ETF는 따라가는 주식). \'이 가격을 넘으면/깨지면\' 같은 조건문 금지. 전문용어·영문 약어 금지", '
                '"chart": "차트 해석 2문장: 추세(trend·이동평균), 모멘텀(RSI·MACD), 거래량, 지지·저항 위치", '
                '"scenario": {"up": "상승 시나리오: 어떤 가격·조건을 넘으면 어떤 흐름", "base": "기본 시나리오", '
                '"down": "하락 시나리오: 어떤 가격·조건이 깨지면 어떤 흐름"}}], '
@@ -853,6 +908,14 @@ def account_html(d, note):
     return page(d["kind"], f"내 계좌 {'+' if pnl >= 0 else '−'}{abs(pnl):.1f}%, 오늘 {sign(a['today'])}", hero + table)
 
 
+def dir_line(h):
+    """카톡 한 줄: 차트 판정(흐름 + 일주일 뒤 오를 확률). 2배 ETF는 따라가는 주식 기준."""
+    v = h.get("dir")
+    if not v or "5" not in v["p"]:
+        return ""
+    return f"{h['base'] + ' ' if h.get('base') else ''}{v['state']} · 일주일 뒤 오를 확률 {v['p']['5']['up']}%"
+
+
 def summary_html(d, note):
     """카톡 첫 장: 종목마다 현재가·오늘 변동폭 + 한 줄 전망. 홈페이지와 같은 다크 톤."""
     e = html.escape
@@ -867,7 +930,7 @@ def summary_html(d, note):
         cls = "up" if h["chg"] > 0 else "dn" if h["chg"] < 0 else "eq"
         a = "▲" if h["chg"] > 0 else "▼" if h["chg"] < 0 else "–"
         fmt = (lambda v: f"{v:,.0f}원") if kr else (lambda v: f"{v:,.2f}달러")
-        line = views.get(h["name"], {}).get("line", "")
+        line = dir_line(h) or views.get(h["name"], {}).get("line", "")
         rows += (f'<div class="r"><div class="l"><b>{e(h["name"])}</b><span>{e(line)}</span></div>'
                  f'<div class="p"><b>{fmt(px)}</b><span class="{cls}">{a} {abs(h["chg"]):.2f}% · {fmt(abs(diff))}</span></div></div>')
     a = d["acct"]
@@ -887,7 +950,8 @@ def summary_html(d, note):
             f'<div class="hd"><b><i class="dot"></i>오늘 내 종목</b><span>{when} · {"미국장" if d["kind"] == "am" else "국내장"} 마감 기준</span></div>'
             f'<div class="acct"><div>평가손익<b class="{"up" if (a["pnl"] or 0) >= 0 else "dn"}">{"+" if (a["pnl"] or 0) >= 0 else "−"}{abs(a["pnl"] or 0):.1f}%</b></div>'
             f'<div>오늘<b class="{"up" if a["today"] >= 0 else "dn"}">{sign(a["today"])}</b></div></div>{rows}'
-            f'<p class="ft">현재가 옆 숫자 = 오늘 등락률 · 1주당 움직인 가격. 시장 해설이며 매매 권유가 아닙니다.</p>')
+            f'<p class="ft">현재가 옆 숫자 = 오늘 등락률 · 1주당 움직인 가격. 확률 = 같은 차트 상태였던 과거에 일주일 뒤 올라 있던 비율'
+            f'(과거 검증 적중률 약 {DIR_CHECK["hit5"]:.0f}%, 참고용). 매매 권유가 아닙니다.</p>')
 
 
 def shoot(doc, path, bg=BG):
@@ -1214,7 +1278,8 @@ def build(kind, note_path=None):
             cp["outlook"] = {str(n): outlook_prob(cp, tones.get(h["name"]), cp.get("inputs", {}), n) for n in (5, 20)}
             log.append({"id": d["id"], "name": h["name"], "inst": cp["inst"], "price": (h["base_tech"] or h["tech"])["price"],
                         "levels": cp["levels"], "chart": {k: [v["up"], v["base"], v["dn"]] for k, v in cp["h"].items()},
-                        "outlook": {k: [v["up"], v["base"], v["dn"]] for k, v in cp["outlook"].items()}})
+                        "outlook": {k: [v["up"], v["base"], v["dn"]] for k, v in cp["outlook"].items()},
+                        **({"dir": {k: v["up"] for k, v in h["dir"]["p"].items()}} if h.get("dir") else {})})
     sf = HERE / "data" / "scores.json"  # 채점 결과를 홈페이지에 보이게
     if sf.exists():
         sj = json.loads(sf.read_text("utf-8"))
@@ -1254,7 +1319,7 @@ def lines_text(kind, d, note):
     for h in d["hold"]:
         v = views.get(h["name"], {})
         a = "▲" if h["chg"] > 0 else "▼" if h["chg"] < 0 else "–"
-        line = v.get("line")
+        line = dir_line(h) or v.get("line")
         if not line and h.get("prob"):
             kr = (h["base"] or h["ticker"]).endswith((".KS", ".KQ"))
             up = h["prob"]["levels"]["up"]
