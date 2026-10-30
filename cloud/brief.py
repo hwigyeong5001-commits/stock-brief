@@ -979,7 +979,7 @@ def shoot(doc, path, bg=BG):
     """Edge 헤드리스로 캡처 후 아래 빈 배경(bg)을 잘라낸다."""
     src = path.with_suffix(".html")
     src.write_text(doc, "utf-8")
-    subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--force-device-scale-factor=1",
+    subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--hide-scrollbars", f"--user-data-dir={path.parent / '.edge-prof'}", "--force-device-scale-factor=1",
                     "--window-size=1080,3200", "--virtual-time-budget=5000", f"--screenshot={path}", src.as_uri()],
                    check=True, capture_output=True, timeout=60)
     im = Image.open(path).convert("RGB")
